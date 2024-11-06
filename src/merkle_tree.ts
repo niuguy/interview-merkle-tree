@@ -119,6 +119,67 @@ export class MerkleTree {
     return this.root;
   }
 
+  /**
+   * Updates multiple elements in the tree in a single batch operation.
+   * @param updates Array of [index, value] tuples to update
+   * @returns The new tree root
+   */
+  async updateElements(updates: Array<[number, Buffer]>): Promise<Buffer> {
+    if (updates.length === 0) return this.root;
+    
+    const batch = this.db.batch();
+    const nodeUpdates = new Map<string, Buffer>();
+    
+    // First, update all leaves
+    for (const [index, value] of updates) {
+      const leafValue = this.hasher.hash(value);
+      await this.updateNode(index, 0, leafValue, batch);
+      nodeUpdates.set(`0:${index}`, leafValue);
+    }
+
+    // Then update all affected parent nodes level by level
+    for (let height = 0; height < this.depth; height++) {
+      const currentLevelUpdates = new Map<number, Buffer>();
+      
+      // Collect all indices that need updating at this height
+      const indices = new Set(
+        Array.from(nodeUpdates.keys())
+          .filter(key => key.startsWith(`${height}:`))
+          .map(key => parseInt(key.split(':')[1]))
+      );
+
+      // Update each affected node's parent
+      for (const index of indices) {
+        const parentIndex = Math.floor(index / 2);
+        const isRight = index % 2 === 1;
+        const siblingIndex = isRight ? index - 1 : index + 1;
+        
+        const currentValue = nodeUpdates.get(`${height}:${index}`) || 
+          await this.getNode(index, height);
+        const siblingValue = nodeUpdates.get(`${height}:${siblingIndex}`) || 
+          await this.getNode(siblingIndex, height);
+        
+        const parentValue = isRight
+          ? this.hasher.compress(siblingValue, currentValue)
+          : this.hasher.compress(currentValue, siblingValue);
+        
+        await this.updateNode(parentIndex, height + 1, parentValue, batch);
+        currentLevelUpdates.set(parentIndex, parentValue);
+      }
+
+      // Add current level updates to nodeUpdates for next iteration
+      for (const [index, value] of currentLevelUpdates) {
+        nodeUpdates.set(`${height + 1}:${index}`, value);
+      }
+    }
+
+    // Update root and metadata
+    this.root = nodeUpdates.get(`${this.depth}:0`) || this.root;
+    await this.writeMetaData(batch);
+    await batch.write();
+    return this.root;
+  }
+
   private getEmptyNodeHash(height: number): Buffer {
     if (height === 0) {
       // Leaf level - hash 64 zero bytes
