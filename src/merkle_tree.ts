@@ -13,6 +13,7 @@ const LEAF_BYTES = 64; // All leaf values are 64 bytes.
 export class MerkleTree {
   private hasher = new Sha256Hasher();
   private root = Buffer.alloc(32);
+  private cache: Map<string, Buffer> = new Map();
 
   /**
    * Constructs a new MerkleTree instance, either initializing an empty tree, or restoring pre-existing state values.
@@ -28,7 +29,7 @@ export class MerkleTree {
       throw Error('Bad depth');
     }
 
-    // Missing implementation.
+    this.root = root || this.getEmptyNodeHash(depth);
   }
 
   /**
@@ -71,16 +72,84 @@ export class MerkleTree {
    *     d1:         [*]                      [*]                       [ ]                     [ ]
    *     d0:   [ ]         [ ]          [*]         [*]           [ ]         [ ]          [ ]        [ ]
    */
-  async getHashPath(index: number) {
-    // Missing implementation.
-    return new HashPath();
+  async getHashPath(index: number): Promise<HashPath> {
+    const path = new HashPath();
+    let currentIndex = index;
+
+    for (let height = 0; height < this.depth; height++) {
+      const isRight = currentIndex % 2 === 1;
+      const pairIndex = isRight ? currentIndex - 1 : currentIndex + 1;
+      const pairHash = await this.getNode(pairIndex, height);
+      const currentHash = await this.getNode(currentIndex, height);
+      path.data.push(isRight ? [pairHash, currentHash] : [currentHash, pairHash]);
+      currentIndex = Math.floor(currentIndex / 2);
+    }
+
+    return path;
   }
 
   /**
    * Updates the tree with `value` at `index`. Returns the new tree root.
    */
-  async updateElement(index: number, value: Buffer) {
-    // Missing implementation.
+  async updateElement(index: number, value: Buffer): Promise<Buffer> {
+    const batch = this.db.batch();
+    let currentValue = this.hasher.hash(value);
+    let currentIndex = index;
+
+    // Store the leaf
+    await this.updateNode(currentIndex, 0, currentValue, batch);
+
+    // Update path to root
+    for (let height = 0; height < this.depth; height++) {
+      const isRight = currentIndex % 2 === 1;
+      const pairIndex = isRight ? currentIndex - 1 : currentIndex + 1;
+      const pairHash = await this.getNode(pairIndex, height);
+
+      currentValue = isRight 
+        ? this.hasher.compress(pairHash, currentValue)
+        : this.hasher.compress(currentValue, pairHash);
+
+      currentIndex = Math.floor(currentIndex / 2);
+      await this.updateNode(currentIndex, height + 1, currentValue, batch);
+    }
+
+    this.root = currentValue;
+    await this.writeMetaData(batch);
+    await batch.write();
     return this.root;
+  }
+
+  private getEmptyNodeHash(height: number): Buffer {
+    if (height === 0) {
+      // Leaf level - hash 64 zero bytes
+      return this.hasher.hash(Buffer.alloc(LEAF_BYTES));
+    }
+    // Internal node - compress two identical child empty hashes
+    const childHash = this.getEmptyNodeHash(height - 1);
+    return this.hasher.compress(childHash, childHash);
+  }
+
+  private async getNode(index: number, height: number): Promise<Buffer> {
+    const key = `${this.name}/node/${height}/${index}`;
+    
+    // Check cache first
+    const cached = this.cache.get(key);
+    if (cached) return cached;
+
+    try {
+      const value = await this.db.get(Buffer.from(key));
+      this.cache.set(key, value);
+      return value;
+    } catch {
+      const empty = this.getEmptyNodeHash(height);
+      this.cache.set(key, empty);
+      return empty;
+    }
+  }
+
+  private async updateNode(index: number, height: number, value: Buffer, batch: LevelUpChain<string, Buffer>) {
+    const key = `${this.name}/node/${height}/${index}`;
+    this.cache.set(key, value);
+    batch.put(key, value);
   }
 }
